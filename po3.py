@@ -1,4 +1,3 @@
-
 from datetime import time
 
 def is_within_range(ts, start_hour, end_hour):
@@ -81,5 +80,6 @@ def analyze_po3_structure(candles):
         "entry": entry,
         "sl": sl,
         "tp": tp,
-        "reason": "PO3 структура: Азия-флэт, Лондон-манипуляция, NY-импульс"
+        "reason": "PO3 Session model: Asia-London-NY",
+        "ob": False,                           
     }

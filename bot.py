@@ -13,6 +13,7 @@ from liquidity import find_swing_highs_lows, is_near_liquidity
 from momentum import calculate_rsi
 from chart import plot_signal_chart
 from logger import log_signal_to_csv
+from po3 import analyze_po3_structure
 import concurrent.futures
 import numpy as np
 
@@ -66,7 +67,7 @@ MIN_SIGNAL_STRENGTH = 3
 
 def main_menu():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.row("🚦 Сигналы", "🔍 Скан")
+    markup.row("🔍 Скан")
     markup.row("📊 Статус", "🧠 Стратегии")
     markup.row("▶️ Старт", "⏸️ Пауза")
     markup.row("🧹 Очистить")
@@ -242,10 +243,11 @@ def scan_symbol(symbol, candles_dict):
 
     results = []
     signals = [
-        detect_liquidity_sweep_and_bos(candles_h1),
-        detect_po3_amd_model(candles_h1),
-        fvg_retest_strategy(candles_h1)
-    ]
+    detect_liquidity_sweep_and_bos(candles_h1),
+    detect_po3_amd_model(candles_h1),
+    analyze_po3_structure(candles_h1),    
+    fvg_retest_strategy(candles_h1)
+]
     for signal in signals:
         required_keys = ("entry", "sl", "tp", "direction")
         if not signal or not signal.get("signal") or not all(k in signal for k in required_keys):
@@ -392,11 +394,12 @@ def handle_scan_all(message):
 @bot.message_handler(commands=['strategies'])
 def handle_strategies(message):
     text = (
-        "📘 Активные стратегии бота:\n"
-        "1️⃣ Liquidity Sweep + BOS\n"
-        "2️⃣ PO3 + AMD Model\n"
-        "3️⃣ FVG Re-Test"
-    )
+    "📘 Активные стратегии бота:\n"
+    "1️⃣ Liquidity Sweep + BOS\n"
+    "2️⃣ PO3 + AMD Model\n"
+    "3️⃣ PO3 (Sessions)\n"               
+    "4️⃣ FVG Re-Test"
+)
     bot.send_message(message.chat.id, text)
 
 @bot.message_handler(commands=['start'])
@@ -410,27 +413,10 @@ def handle_start(message):
         reply_markup=main_menu()
     )
 
-@bot.message_handler(commands=['signal'])
-def handle_signal_command(message):
-    args = message.text.split()
-    if len(args) > 1:
-        symbol = args[1].strip().upper()
-        if symbol in symbols:
-            bot.send_message(message.chat.id, f"Детальный анализ для {symbol}...")
-            detailed_manual_analysis(symbol, message.chat.id)
-        else:
-            bot.send_message(message.chat.id, "Тикер не найден. Введите тикер (например, BTCUSDT) для ручного анализа.")
-    else:
-        bot.send_message(message.chat.id, "Введите тикер (например, BTCUSDT) для ручного анализа.")
-
 @bot.message_handler(func=lambda message: message.text == "🔍 Скан")
 def handle_scan_btn(message):
     bot.send_message(message.chat.id, "📡 Поиск сигналов по всем инструментам...")
     handle_scan_all(message)
-
-@bot.message_handler(func=lambda message: message.text == "🚦 Сигналы")
-def handle_signal_btn(message):
-    bot.send_message(message.chat.id, "Введите тикер (например, BTCUSDT) для ручного анализа.")
 
 @bot.message_handler(func=lambda message: message.text == "📊 Статус")
 def handle_status(message):
@@ -473,12 +459,6 @@ def handle_clear(message):
         if "message to delete not found" not in str(e):
             bot.send_message(message.chat.id, f"Ошибка при удалении: {e}")
 
-# This handler enables manual analysis on request (user types BTCUSDT etc.)
-@bot.message_handler(func=lambda message: message.text and message.text.strip().upper() in symbols)
-def handle_manual_symbol_analysis(message):
-    symbol = message.text.strip().upper()
-    bot.send_message(message.chat.id, f"Детальный анализ для {symbol}...")
-    detailed_manual_analysis(symbol, message.chat.id)
 
 def calculate_smart_money_rr(entry, sl, tp, direction):
     try:
