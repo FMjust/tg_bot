@@ -16,10 +16,9 @@ from logger import log_signal_to_csv
 from po3 import analyze_po3_structure
 import concurrent.futures
 import numpy as np
-
-# --- NEW: Excel logging dependencies ---
 import openpyxl
 from openpyxl import load_workbook
+from topdown import get_trend_htf, get_pd_zones, filter_signals_by_htf
 
 def log_transaction_to_excel(symbol, direction, entry, sl, tp, result, strategy, filename="transactions.xlsx"):
     try:
@@ -242,13 +241,22 @@ def scan_symbol(symbol, candles_dict):
     candles_d1 = candles_dict["d1"]
 
     results = []
+
+    # --- Top-Down анализ и Premium/Discount ---
+    candles_htf = candles_d1  # D1 - старший ТФ
+    htf_trend = get_trend_htf(candles_htf)
+    premium_zone, discount_zone = get_pd_zones(candles_htf)
+
     signals = [
-    detect_liquidity_sweep_and_bos(candles_h1),
-    detect_po3_amd_model(candles_h1),
-    analyze_po3_structure(candles_h1),    
-    fvg_retest_strategy(candles_h1)
-]
-    for signal in signals:
+        detect_liquidity_sweep_and_bos(candles_h1),
+        detect_po3_amd_model(candles_h1),
+        analyze_po3_structure(candles_h1),
+        fvg_retest_strategy(candles_h1)
+    ]
+    # Фильтрация сигналов по тренду HTF
+    filtered_signals = filter_signals_by_htf(signals, htf_trend)
+
+    for signal in filtered_signals:
         required_keys = ("entry", "sl", "tp", "direction")
         if not signal or not signal.get("signal") or not all(k in signal for k in required_keys):
             continue
@@ -257,12 +265,23 @@ def scan_symbol(symbol, candles_dict):
             candles_m15=candles_m15,
             candles_d1=candles_d1
         )
+        # Добавление информации о зонах Premium/Discount
+        entry = signal.get("entry", 0)
+        if isinstance(entry, (float, int)):
+            if premium_zone[0] <= entry <= premium_zone[1]:
+                reasons.append("Entry в зоне Premium (верхняя половина диапазона)")
+            elif discount_zone[0] <= entry <= discount_zone[1]:
+                reasons.append("Entry в зоне Discount (нижняя половина диапазона)")
+            else:
+                reasons.append("Entry вне зон Premium/Discount")
         results.append({
             "signal": signal, "score": score, "reasons": reasons,
             "fvg_ok": fvg_ok, "multi_bos": multi_bos,
             "near_liq": near_liq, "rsi_ok": rsi_ok, "rsi": rsi
         })
     return symbol, results
+
+# ... Остальной файл без изменений ...
 
 def detailed_manual_analysis(symbol, chat_id):
     candles_dict = fetch_all_candles(symbol)
