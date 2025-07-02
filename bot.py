@@ -54,7 +54,7 @@ def log_transaction_to_excel(symbol, direction, entry, sl, tp, result, strategy,
     except Exception as e:
         print(f"[ExcelLog] Error logging transaction: {e}")
 
-BOT_TOKEN = "8133935884:AAGlKSU1qZAk4mCqMsi7UbyUAWRp5h_Dqv0"
+BOT_TOKEN = "8133935884:AAGlKSU1qZAk4mCqMsi7UbyUAWRp5h_Dvj1"
 bot = telebot.TeleBot(BOT_TOKEN)
 
 symbols = [
