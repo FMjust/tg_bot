@@ -4,25 +4,43 @@ import os
 import telebot
 import threading
 import time
+import traceback
 from datetime import datetime
 from telebot import types
 from smc import detect_liquidity_sweep_and_bos, detect_po3_amd_model
 from binance_api import get_candles
-from fvg import find_fvg_zones, is_price_in_fvg
+from fvg import find_fvg_zones as find_fvg_zones_fvg  # если понадобится отдельно, иначе можно убрать
 from liquidity import find_swing_highs_lows, is_near_liquidity
 from momentum import calculate_rsi
 from chart import plot_signal_chart
 from logger import log_signal_to_csv
 from po3 import analyze_po3_structure
+from orderflow import OrderFlowAnalyzer
 import concurrent.futures
+from volume import average_volume, is_volume_spike, find_volume_clusters, filter_zones_by_volume, zone_has_cluster
 import numpy as np
 import openpyxl
 from openpyxl import load_workbook
-from topdown import get_trend_htf, get_pd_zones, filter_signals_by_htf
+from topdown import (
+    get_trend_htf, get_pd_zones, filter_signals_by_htf,
+    find_poi_zones, find_fta_zones
+)
+ORDERFLOW_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "OPUSDT", "SNXUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "TRXUSDT",
+    "SUIUSDT", "LINKUSDT", "AVAXUSDT", "XLMUSDT", "SHIBUSDT", "BCHUSDT", "HBARUSDT", "XMRUSDT", "TONUSDT", "LTCUSDT",
+    "PEPEUSDT", "UNIUSDT", "AAVEUSDT", "TAOUSDT", "NEARUSDT", "APTUSDT", "ONDOUSDT", "ICPUSDT", "ETCUSDT",
+    "TRUMPUSDT", "RENDERUSDT", "POLUSDT", "VETUSDT", "ENAUSDT", "FETUSDT", "WLDUSDT", "ARBUSDT", "ALGOUSDT",
+    "ATOMUSDT", "FILUSDT", "JUPUSDT", "TIAUSDT", "INJUSDT", "STXUSDT", "SUSDT", "SEIUSDT", "IMXUSDT", "QNTUSDT",
+    "WIFUSDT", "FORMUSDT", "GRTUSDT", "DEXEUSDT", "CRVUSDT", "MKRUSDT", "JASMYUSDT", "ZECUSDT", "GALAUSDT",
+    "THETAUSDT", "CAKEUSDT", "PENGUUSDT", "ENSUSDT", "PAXGUSDT", "IOTAUSDT", "SANDUSDT", "LDOUSDT", "PYTHUSDT",
+    "PENDLEUSDT"]
+orderflow_analyzers = {}
+for symbol in ORDERFLOW_SYMBOLS:
+    analyzer = OrderFlowAnalyzer(symbol)
+    analyzer.start()
+    orderflow_analyzers[symbol] = analyzer
 
 def log_transaction_to_excel(symbol, direction, entry, sl, tp, result, strategy, filename="transactions.xlsx"):
     try:
-        # Try to open the file, or create if not exists
         if os.path.exists(filename):
             wb = load_workbook(filename)
             ws = wb.active
@@ -36,7 +54,7 @@ def log_transaction_to_excel(symbol, direction, entry, sl, tp, result, strategy,
     except Exception as e:
         print(f"[ExcelLog] Error logging transaction: {e}")
 
-BOT_TOKEN = "8133935884:AAFRAfUAiooZAoByUf2vtcQan5_yYl9nxzo"
+BOT_TOKEN = "8133935884:AAGlKSU1qZAk4mCqMsi7UbyUAWRp5h_Dqv0"
 bot = telebot.TeleBot(BOT_TOKEN)
 
 symbols = [
@@ -62,7 +80,7 @@ WEIGHTS = {
     "rsi": 1
 }
 
-MIN_SIGNAL_STRENGTH = 3
+MIN_SIGNAL_STRENGTH = 0
 
 def main_menu():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -120,7 +138,7 @@ def fvg_retest_strategy(candles):
     if not candles or len(candles) < 50:
         return {}
 
-    zones = find_fvg_zones(candles)
+    zones = find_fvg_zones_fvg(candles)
     last_close = candles[-1]['close']
     last_open = candles[-1]['open']
     closes = [c['close'] for c in candles]
@@ -129,7 +147,8 @@ def fvg_retest_strategy(candles):
 
     signal = None
 
-    for zone_low, zone_high in zones:
+    for zone in zones:
+        zone_low, zone_high = zone['from'], zone['to']
         if zone_low <= last_close <= zone_high:
             direction = 'long' if last_close > last_open else 'short'
             rsi = calculate_rsi(candles)
@@ -194,7 +213,10 @@ def evaluate_signal_strength(signal, candles_h1, symbol, candles_m15=None, candl
     else:
         reasons.append("OB не подтверждён")
 
-    fvg_ok = is_price_in_fvg(signal['entry'], find_fvg_zones(candles_h1))
+    fvg_ok = any(
+        zone['from'] <= signal['entry'] <= zone['to']
+        for zone in find_fvg_zones_fvg(candles_h1)
+    )
     if fvg_ok:
         score += WEIGHTS["fvg"]
     else:
@@ -234,7 +256,7 @@ def evaluate_signal_strength(signal, candles_h1, symbol, candles_m15=None, candl
         return 0, reasons, fvg_ok, multi_bos, near_liq, rsi_ok, rsi
 
     return score, reasons, fvg_ok, multi_bos, near_liq, rsi_ok, rsi
-
+    
 def scan_symbol(symbol, candles_dict):
     candles_h1 = candles_dict["h1"]
     candles_m15 = candles_dict["m15"]
@@ -247,6 +269,18 @@ def scan_symbol(symbol, candles_dict):
     htf_trend = get_trend_htf(candles_htf)
     premium_zone, discount_zone = get_pd_zones(candles_htf)
 
+    # Определяем зоны для POI (entry) и FTA (take)
+    if htf_trend == 'long':
+        poi_zone = discount_zone
+        fta_zone = premium_zone
+    else:
+        poi_zone = premium_zone
+        fta_zone = discount_zone
+
+    # Поиск POI и FTA
+    pois = find_poi_zones(candles_h1, poi_zone, htf_trend)
+    ftas = find_fta_zones(candles_h1, htf_trend, fta_zone)
+
     signals = [
         detect_liquidity_sweep_and_bos(candles_h1),
         detect_po3_amd_model(candles_h1),
@@ -256,16 +290,62 @@ def scan_symbol(symbol, candles_dict):
     # Фильтрация сигналов по тренду HTF
     filtered_signals = filter_signals_by_htf(signals, htf_trend)
 
+    last_candle = candles_h1[-1]
+    avg_vol = average_volume(candles_h1)
+    clusters = find_volume_clusters(candles_h1, coef=2.0, n=40)
+
+    # --- Order Flow анализатор (получаем заранее, используем внутри цикла) ---
+    analyzer = orderflow_analyzers.get(symbol.upper())
+    orderflow_info = analyzer.get_info() if analyzer else None
+
     for signal in filtered_signals:
         required_keys = ("entry", "sl", "tp", "direction")
         if not signal or not signal.get("signal") or not all(k in signal for k in required_keys):
             continue
+
+        in_poi = any(poi['from'] <= signal['entry'] <= poi['to'] for poi in pois)
+        if not in_poi:
+            continue
+
+        # ОБЪЁМНЫЙ ФИЛЬТР
+        if not is_volume_spike(last_candle, candles_h1, coef=1.5):
+            reasons = ["Нет всплеска объёма на последней свече"]
+            results.append({
+                "signal": signal, "score": 0, "reasons": reasons,
+                "fvg_ok": False, "multi_bos": False,
+                "near_liq": False, "rsi_ok": False, "rsi": None
+            })
+            continue
+
+        # ФИЛЬТР ПО КЛАСТЕРАМ В POI
+        pois_with_cluster = [z for z in pois if zone_has_cluster(z, clusters)]
+        if not pois_with_cluster:
+            reasons = ["Нет объёмного кластера в зонах POI"]
+            results.append({
+                "signal": signal, "score": 0, "reasons": reasons,
+                "fvg_ok": False, "multi_bos": False,
+                "near_liq": False, "rsi_ok": False, "rsi": None
+            })
+            continue
+        pois = pois_with_cluster
+
+        # --- Order Flow фильтр ---
+        if orderflow_info:
+            if orderflow_info['cvd'] < 0:
+                reasons = ["Order Flow: доминируют продажи, сигнал фильтруется"]
+                results.append({
+                    "signal": signal, "score": 0, "reasons": reasons,
+                    "fvg_ok": False, "multi_bos": False,
+                    "near_liq": False, "rsi_ok": False, "rsi": None
+                })
+                continue
+
+        # --- Оценка силы сигнала ---
         score, reasons, fvg_ok, multi_bos, near_liq, rsi_ok, rsi = evaluate_signal_strength(
             signal, candles_h1, symbol,
-            candles_m15=candles_m15,
-            candles_d1=candles_d1
+            candles_m15=candles_m15, candles_d1=candles_d1
         )
-        # Добавление информации о зонах Premium/Discount
+
         entry = signal.get("entry", 0)
         if isinstance(entry, (float, int)):
             if premium_zone[0] <= entry <= premium_zone[1]:
@@ -274,15 +354,35 @@ def scan_symbol(symbol, candles_dict):
                 reasons.append("Entry в зоне Discount (нижняя половина диапазона)")
             else:
                 reasons.append("Entry вне зон Premium/Discount")
+
+        if ftas:
+            signal['tp'] = ftas[0]['from']
+
+        if pois:
+            poi_strings = [f"{p['type']}({p['from']:.2f}-{p['to']:.2f})" for p in pois]
+            reasons.append(f"POI зоны: {poi_strings}")
+        if ftas:
+            reasons.append(f"FTA зона для TP: {ftas[0]['from']:.2f}-{ftas[0]['to']:.2f}")
+
+        # ДОБАВЛЯЕМ ОБЪЁМНУЮ ИНФОРМАЦИЮ
+        reasons.append(f"Объём: {last_candle['volume']} (средний: {int(avg_vol)})")
+        reasons.append(f"Всплеск объёма: {'Да' if is_volume_spike(last_candle, candles_h1) else 'Нет'}")
+        reasons.append(f"Кластеров за 40 свечей: {len(clusters)}")
+
+        # ДОБАВЛЯЕМ Order Flow инфу (если есть)
+        if orderflow_info:
+            reasons.append(
+                f"Order Flow: CVD={orderflow_info['cvd']:.2f}, "
+                f"Buy={orderflow_info['buy_vol']:.2f}, Sell={orderflow_info['sell_vol']:.2f}"
+            )
+
         results.append({
             "signal": signal, "score": score, "reasons": reasons,
             "fvg_ok": fvg_ok, "multi_bos": multi_bos,
             "near_liq": near_liq, "rsi_ok": rsi_ok, "rsi": rsi
         })
+
     return symbol, results
-
-# ... Остальной файл без изменений ...
-
 def detailed_manual_analysis(symbol, chat_id):
     candles_dict = fetch_all_candles(symbol)
     candles_h1 = candles_dict["h1"]
@@ -507,10 +607,54 @@ def monitor_signals():
                 symbols
             ))
 
+        for symbol in symbols:
+            _, results = scan_symbol(symbol, candles_map[symbol])
+            for res in results:
+                signal = res["signal"]
+                score = res["score"]
+                strategy = signal.get("strategy", "Strategy")
+                key = (symbol, strategy)
+                required_keys = ("entry", "sl", "tp", "direction")
+                if score < MIN_SIGNAL_STRENGTH or not all(k in signal for k in required_keys):
+                    continue
+                if key in active_signals:
+                    continue  
+                active_signals[key] = signal
+                rr = calculate_risk_reward(
+                    signal['entry'],
+                    signal['sl'],
+                    signal['tp'],
+                    signal['direction']
+                )
+                direction_emoji = "🟢 LONG" if signal['direction'] == 'long' else "🔴 SHORT"
+                text = (
+                    f"\n<b>{symbol}</b> | <b>{signal.get('strategy', 'Strategy')}</b>\n"
+                    f"{direction_emoji}\n"
+                    f"🎯 Entry: {signal['entry']:.2f} | SL: {signal['sl']:.2f} | TP: {signal['tp']:.2f} | R|R: {rr if rr is not None else 'N/A'}\n"
+                    f"💡 Причина: {signal.get('reason')}\n"
+                    f"Сила сигнала: {score} из 7.5\n"
+                )
+                log_transaction_to_excel(
+                    symbol=symbol,
+                    direction=signal['direction'],
+                    entry=signal['entry'],
+                    sl=signal['sl'],
+                    tp=signal['tp'],
+                    result="signal",
+                    strategy=signal.get('strategy', 'Strategy')
+                )
+                os.makedirs("graphic", exist_ok=True)
+                timestamp = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
+                chart_filename = f"graphic/{timestamp}_{symbol}_{signal.get('strategy', 'strat')}.png"
+                plot_signal_chart(candles_map[symbol]["h1"], signal, symbol, chart_filename)
+                with open(chart_filename, "rb") as img:
+                    bot.send_photo(chat_id, img, caption=text, parse_mode="HTML")
+            
+
         for (symbol, strategy), signal in list(active_signals.items()):
             required_keys = ("entry", "sl", "tp", "direction")
             if not signal or not all(k in signal for k in required_keys):
-                continue  # skip incomplete signals!
+                continue  
 
             candles = candles_map[symbol]["h1"]
             current_price = candles[-1]['close']
@@ -605,4 +749,5 @@ while True:
         bot.polling(none_stop=True)
     except Exception as e:
         print(f"Polling crashed with error: {e}. Restarting in 15 seconds...")
+        traceback.print_exc()
         time.sleep(15)
